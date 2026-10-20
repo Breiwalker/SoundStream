@@ -10,7 +10,17 @@ public final class Protocol {
     public static final String CHANNEL = "soundstream:main";
 
     public static final int MAGIC = 0x5353;
-    public static final int VERSION = 1;
+    /** Oldest client protocol the Paper plugin still accepts. */
+    public static final int MIN_SUPPORTED_VERSION = 1;
+    /**
+     * v3 adds LOOP boundaries for continuously re-streamed loop playback.
+     * v2 made CREDIT mandatory so the client's encoded buffer stays bounded.
+     */
+    public static final int VERSION = 3;
+
+    public static boolean isSupportedVersion(int version) {
+        return version >= MIN_SUPPORTED_VERSION && version <= VERSION;
+    }
 
     public static final int MAX_STRING_BYTES = 256;
     public static final int MAX_DATA_BYTES = 65_535;
@@ -44,13 +54,23 @@ public final class Protocol {
     public static final int TYPE_END = 0x12;
     public static final int TYPE_UPDATE = 0x13;
     public static final int TYPE_CLOSE = 0x14;
+    public static final int TYPE_LOOP = 0x15;
 
-    public static final int DEFAULT_CLIENT_WINDOW_BYTES = 512 * 1024;
+    /**
+     * Encoded bytes the client may hold for one stream before it must grant
+     * more CREDIT. This bounds client memory independently of file size.
+     */
+    public static final int DEFAULT_CLIENT_WINDOW_BYTES = 4 * 1024 * 1024;
     public static final int DEFAULT_CLIENT_CHUNK_BYTES = 32 * 1024;
     public static final int DEFAULT_CLIENT_MAX_STREAMS = 4;
+    /** Reserved for protocol compatibility; playback no longer retains whole files. */
     public static final int DEFAULT_FULL_BUFFER_BYTES = 2 * 1024 * 1024;
     public static final int DEFAULT_LOOP_CACHE_BYTES = 8 * 1024 * 1024;
-    public static final int DEFAULT_SERVER_MAX_FILE_BYTES = 32 * 1024 * 1024;
+    /** Hard ceiling shared by both sides; u32/int sizes make this the practical cap. */
+    public static final int MAX_FILE_BYTES = 1024 * 1024 * 1024;
+    /** Protocol v1 clients refuse OPEN above this size. */
+    public static final int V1_MAX_FILE_BYTES = 64 * 1024 * 1024;
+    public static final int DEFAULT_SERVER_MAX_FILE_BYTES = MAX_FILE_BYTES;
     public static final int DEFAULT_SERVER_MAX_STREAMS = 4;
 
     public static String reasonName(int reason) {

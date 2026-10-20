@@ -27,8 +27,16 @@ fabricApi {
     }
 }
 
+base {
+    archivesName = "SoundStream"
+}
+
 repositories {
     mavenCentral()
+    maven {
+        name = "TerraformersMC"
+        url = "https://maven.terraformersmc.com/releases/"
+    }
 }
 
 sourceSets {
@@ -44,7 +52,8 @@ dependencies {
 
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    compileOnly "org.lwjgl:lwjgl-stb:3.4.3"
+    // Optional: only needed for the Mod Menu settings screen.
+    compileOnly "com.terraformersmc:modmenu:21.0.0"
 
     implementation "javazoom:jlayer:1.0.1"
     include "javazoom:jlayer:1.0.1"

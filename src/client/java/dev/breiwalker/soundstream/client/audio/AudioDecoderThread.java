@@ -12,7 +12,6 @@ import org.lwjgl.stb.STBVorbisInfo;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -21,17 +20,17 @@ import java.nio.IntBuffer;
 import java.nio.ShortBuffer;
 
 /**
- * Decodes audio as it arrives. The first pass uses the growing network buffer;
- * loop passes reuse the complete file that is already in memory.
+ * Decodes audio as it arrives from the bounded network buffer. Loop passes are
+ * re-streamed by the server and restarted at each LOOP boundary.
  */
 public final class AudioDecoderThread implements Runnable {
+    private static final int TRANSFER_BYTES = 64 * 1024;
+
     private final ClientStream stream;
-    private final byte[] data;
     private final Thread thread;
 
-    public AudioDecoderThread(ClientStream stream, byte[] data) {
+    public AudioDecoderThread(ClientStream stream) {
         this.stream = stream;
-        this.data = data;
         this.thread = new Thread(this, "SoundStream decoder " + stream.id());
         this.thread.setDaemon(true);
         this.thread.setPriority(Math.min(Thread.MAX_PRIORITY, Thread.NORM_PRIORITY + 1));
@@ -50,28 +49,19 @@ public final class AudioDecoderThread implements Runnable {
         try {
             boolean firstPass = true;
             while (stream.running()) {
-                if (firstPass) {
-                    firstPass = false;
-                    if (stream.codec() == Protocol.CODEC_OGG_VORBIS) {
-                        decodeVorbisProgressive();
-                    } else {
-                        decodeMp3(new StreamInputStream(stream));
-                    }
-                } else {
-                    if (!stream.awaitEnd()) {
+                if (!firstPass) {
+                    if (!stream.awaitLoopBoundary()) {
                         break;
                     }
-                    if (stream.codec() == Protocol.CODEC_OGG_VORBIS) {
-                        decodeVorbisMemory(data);
-                    } else {
-                        decodeMp3(new ByteArrayInputStream(data));
-                    }
+                    stream.beginNextPass();
                 }
-
+                firstPass = false;
+                if (stream.codec() == Protocol.CODEC_OGG_VORBIS) {
+                    decodeVorbisProgressive();
+                } else {
+                    decodeMp3(new StreamInputStream(stream));
+                }
                 if (!stream.loop() || !stream.running()) {
-                    break;
-                }
-                if (!stream.awaitEnd()) {
                     break;
                 }
             }
@@ -88,8 +78,8 @@ public final class AudioDecoderThread implements Runnable {
     private void decodeVorbisProgressive() throws Exception {
         long decoder = 0;
         ByteBuffer pending = ByteBuffer.allocateDirect(512 * 1024);
+        byte[] transfer = new byte[TRANSFER_BYTES];
         int pendingLength = 0;
-        int readPosition = 0;
         try {
             STBVorbisInfo info = STBVorbisInfo.calloc();
             try {
@@ -97,24 +87,11 @@ public final class AudioDecoderThread implements Runnable {
                 int outputChannels = 0;
 
                 while (stream.running()) {
-                    int available = stream.receivedBytes();
-                    if (readPosition < available && pendingLength < pending.capacity()) {
-                        int copy = Math.min(available - readPosition, pending.capacity() - pendingLength);
-                        pending.position(pendingLength);
-                        pending.limit(pending.capacity());
-                        pending.put(data, readPosition, copy);
-                        pendingLength += copy;
-                        readPosition += copy;
-                    }
-
                     if (pendingLength == 0) {
-                        if (stream.endReceived()) {
+                        pendingLength = append(pending, transfer, 0);
+                        if (pendingLength < 0) {
                             return;
                         }
-                        if (!stream.awaitBytes(readPosition)) {
-                            return;
-                        }
-                        continue;
                     }
 
                     pending.position(0);
@@ -133,10 +110,11 @@ public final class AudioDecoderThread implements Runnable {
                                 if (stream.endReceived() && pendingLength == 0) {
                                     return;
                                 }
-                                if (stream.endReceived() && pendingLength == pending.capacity()) {
+                                if (pendingLength == pending.capacity()) {
                                     throw new IOException("Truncated Ogg Vorbis header");
                                 }
-                                if (!stream.awaitBytes(readPosition)) {
+                                pendingLength = append(pending, transfer, pendingLength);
+                                if (pendingLength < 0) {
                                     return;
                                 }
                                 continue;
@@ -162,10 +140,11 @@ public final class AudioDecoderThread implements Runnable {
                                 return;
                             }
                             if (used == 0) {
-                                if (stream.endReceived()) {
+                                if (pendingLength == pending.capacity()) {
                                     throw new IOException("Truncated Ogg Vorbis frame");
                                 }
-                                if (!stream.awaitBytes(readPosition)) {
+                                pendingLength = append(pending, transfer, pendingLength);
+                                if (pendingLength < 0) {
                                     return;
                                 }
                             }
@@ -192,6 +171,25 @@ public final class AudioDecoderThread implements Runnable {
         }
     }
 
+    /**
+     * Appends up to the remaining pending-buffer space, blocking until data
+     * arrives. Returns the new pending length, or -1 at the end of the stream.
+     */
+    private int append(ByteBuffer pending, byte[] transfer, int pendingLength) {
+        int space = pending.capacity() - pendingLength;
+        if (space <= 0) {
+            return pendingLength;
+        }
+        int read = stream.readEncoded(transfer, 0, Math.min(transfer.length, space));
+        if (read < 0) {
+            return -1;
+        }
+        pending.position(pendingLength);
+        pending.limit(pending.capacity());
+        pending.put(transfer, 0, read);
+        return pendingLength + read;
+    }
+
     private static int consume(ByteBuffer pending, int pendingLength, int used) {
         int consumed = Math.max(0, Math.min(pendingLength, used));
         pending.position(consumed);
@@ -199,48 +197,6 @@ public final class AudioDecoderThread implements Runnable {
         int remaining = pending.position();
         pending.position(remaining);
         return remaining;
-    }
-
-    private void decodeVorbisMemory(byte[] data) throws Exception {
-        ByteBuffer nativeData = ByteBuffer.allocateDirect(data.length);
-        nativeData.put(data).flip();
-        long decoder = 0;
-        try (STBVorbisInfo info = STBVorbisInfo.calloc()) {
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                IntBuffer error = stack.mallocInt(1);
-                decoder = STBVorbis.stb_vorbis_open_memory(nativeData, error, null);
-                if (decoder == 0) {
-                    throw new IOException("Could not open Ogg Vorbis stream (error " + error.get(0) + ")");
-                }
-                STBVorbis.stb_vorbis_get_info(decoder, info);
-            }
-
-            int inputChannels = info.channels();
-            int outputChannels = stream.positional() ? 1 : Math.min(2, inputChannels);
-            ByteBuffer pcmBytes = ByteBuffer.allocateDirect(info.max_frame_size() * inputChannels * 2)
-                    .order(ByteOrder.nativeOrder());
-            ShortBuffer pcm = pcmBytes.asShortBuffer();
-            short[] samples = new short[info.max_frame_size() * inputChannels];
-            stream.setFormat(info.sample_rate(), outputChannels);
-
-            while (stream.running()) {
-                pcm.clear();
-                int frames = STBVorbis.stb_vorbis_get_frame_short_interleaved(decoder, inputChannels, pcm);
-                if (frames == 0) {
-                    break;
-                }
-                pcm.position(0);
-                pcm.get(samples, 0, frames * inputChannels);
-                if (!stream.pcmQueue().offer(PcmConverter.fromInterleavedShorts(
-                        samples, frames, inputChannels, outputChannels))) {
-                    break;
-                }
-            }
-        } finally {
-            if (decoder != 0) {
-                STBVorbis.stb_vorbis_close(decoder);
-            }
-        }
     }
 
     private void decodeMp3(InputStream input) throws Exception {
@@ -281,31 +237,19 @@ public final class AudioDecoderThread implements Runnable {
         }
     }
 
-    /**
-     * Blocking InputStream over the growing full-file buffer. JLayer can parse
-     * and decode frames while the rest of the song is still arriving.
-     */
+    /** Blocking InputStream over the bounded encoded buffer. */
     private static final class StreamInputStream extends InputStream {
         private final ClientStream stream;
-        private final byte[] data;
-        private int position;
+        private final byte[] single = new byte[1];
 
         private StreamInputStream(ClientStream stream) {
             this.stream = stream;
-            this.data = stream.fullBuffer();
         }
 
         @Override
         public int read() {
-            while (stream.running() && position >= stream.receivedBytes()) {
-                if (stream.endReceived() || !stream.awaitData(position)) {
-                    return -1;
-                }
-            }
-            if (!stream.running()) {
-                return -1;
-            }
-            return data[position++] & 0xFF;
+            int read = stream.readEncoded(single, 0, 1);
+            return read <= 0 ? -1 : single[0] & 0xFF;
         }
 
         @Override
@@ -313,23 +257,12 @@ public final class AudioDecoderThread implements Runnable {
             if (length == 0) {
                 return 0;
             }
-            while (stream.running() && position >= stream.receivedBytes()) {
-                if (stream.endReceived() || !stream.awaitData(position)) {
-                    return -1;
-                }
-            }
-            if (!stream.running()) {
-                return -1;
-            }
-            int available = Math.min(length, stream.receivedBytes() - position);
-            System.arraycopy(data, position, target, targetOffset, available);
-            position += available;
-            return available;
+            return stream.readEncoded(target, targetOffset, length);
         }
 
         @Override
         public int available() {
-            return Math.max(0, stream.receivedBytes() - position);
+            return Math.max(0, stream.availableEncoded());
         }
     }
 }

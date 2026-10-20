@@ -3,15 +3,18 @@
 sounds-directory: sounds
 
 # Maximum size of one source file.
-max-file-bytes: 33554432
-
-# Largest file the client is allowed to retain for looping.
-max-loop-bytes: 8388608
+# Up to 1073741824 (1 GiB) is accepted. Files are streamed from disk, so this
+# limit does not increase the plugin's memory use.
+max-file-bytes: 1073741824
 
 # Per-player limits. The client's advertised limits are also enforced.
 max-streams-per-player: 4
-window-bytes: 524288
+# Encoded bytes buffered per stream on the client. The server sends no more
+# than this until the client grants CREDIT as playback consumes data.
+window-bytes: 4194304
 chunk-bytes: 32768
+# Maximum encoded bytes sent per stream per server tick.
+send-bytes-per-tick: 1048576
 
 # Used by the /soundstream play command unless overridden.
 default-volume: 1.0

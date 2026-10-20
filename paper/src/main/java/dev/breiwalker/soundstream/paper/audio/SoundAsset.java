@@ -1,9 +1,18 @@
 package dev.breiwalker.soundstream.paper.audio;
 
-public record SoundAsset(String id, byte[] data, int codec) {
+import java.nio.file.Path;
+import java.util.Objects;
+
+/**
+ * Validated metadata for a sound file. The encoded audio is never held in
+ * memory; sessions open the path and stream it from disk.
+ */
+public record SoundAsset(String id, Path path, int size, int codec) {
     public SoundAsset {
-        if (data == null || data.length == 0) {
-            throw new IllegalArgumentException("Sound data is empty");
+        Objects.requireNonNull(id, "id");
+        Objects.requireNonNull(path, "path");
+        if (size <= 0) {
+            throw new IllegalArgumentException("Sound size must be positive");
         }
     }
 }

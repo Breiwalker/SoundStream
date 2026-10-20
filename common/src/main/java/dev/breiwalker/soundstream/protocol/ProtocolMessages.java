@@ -12,7 +12,8 @@ public sealed interface ProtocolMessages permits
         ProtocolMessages.Data,
         ProtocolMessages.End,
         ProtocolMessages.Update,
-        ProtocolMessages.Close {
+        ProtocolMessages.Close,
+        ProtocolMessages.Loop {
 
     record Hello(
             int windowBytes,
@@ -80,5 +81,12 @@ public sealed interface ProtocolMessages permits
         public Close {
             message = Objects.requireNonNullElse(message, "");
         }
+    }
+
+    /**
+     * Marks the end of one pass of a looped stream. DATA for the next pass
+     * follows immediately; the stream is not closed.
+     */
+    record Loop(int streamId) implements ProtocolMessages {
     }
 }

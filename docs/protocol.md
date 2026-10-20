@@ -1,8 +1,8 @@
-# SoundStream Wire Protocol v1
+# SoundStream Wire Protocol v3
 
 Channel: `soundstream:main`
 
-All integers are big-endian. The server sends the complete encoded song in DATA frames. Chunking is transport-only; the client allocates `totalBytes`, appends every frame, and can start progressive playback after a short prebuffer. The complete file is retained for looping and final validation.
+All integers are big-endian. The server streams the complete encoded song in DATA frames. Chunking is transport-only; the client keeps a bounded encoded buffer (the negotiated window), grants CREDIT as the decoder consumes bytes, and can start progressive playback after a short prebuffer. Files up to 1 GiB are supported; the client never allocates the whole song. Looped streams are re-sent continuously, one pass at a time, separated by LOOP markers; they use the same bounded buffer and have no size limit.
 
 ## Header
 
@@ -11,21 +11,23 @@ Every frame starts with:
 | Field | Type |
 |---|---|
 | magic | `u16` = `0x5353` |
-| version | `u8` = `1` |
+| version | `u8` = `3` |
 | type | `u8` |
 | streamId | `i32` (`0` for handshake messages) |
 
 Strings are `u16` byte length plus UTF-8, maximum 256 bytes. Implementations must reject truncated frames, unknown types, unknown flags, oversized strings/chunks, and trailing bytes.
+
+The Paper plugin accepts frames with version `1`, `2`, or `3` and replies with the version the client completed its handshake with. Version `1` clients receive the whole file with no CREDIT; version `2` clients use CREDIT; only version `3` clients use LOOP boundaries and continuous loop streaming.
 
 ## Client to server
 
 | Type | Name | Body |
 |---|---|---|
 | `0x01` | HELLO | `u32 windowBytes`, `u16 maxChunkBytes`, `u8 maxStreams`, `u32 fullBufferBytes`, `u32 loopCacheBytes`, `string clientVersion` |
-| `0x02` | CREDIT | `u32 bytes` (reserved; current clients do not send it) |
+| `0x02` | CREDIT | `u32 bytes` |
 | `0x03` | DONE | `u8 reason`, `string message` |
 
-`windowBytes`, `fullBufferBytes`, and CREDIT are reserved for compatibility. The v1 server sends the whole song without waiting for credit.
+`fullBufferBytes` and `loopCacheBytes` are reserved. `windowBytes` is the maximum encoded audio the client buffers for one stream; the server grants that much initial credit and refills it from CREDIT messages. The server sends DATA only while credit is available.
 
 ## Server to client
 
@@ -38,8 +40,9 @@ Strings are `u16` byte length plus UTF-8, maximum 256 bytes. Implementations mus
 | `0x12` | END | empty |
 | `0x13` | UPDATE | `f32 volume`, `f32 x`, `f32 y`, `f32 z` |
 | `0x14` | CLOSE | `u8 reason`, `string message` |
+| `0x15` | LOOP | empty; marks the end of one loop pass |
 
-Codecs: `1` = Ogg Vorbis, `2` = MP3. Flags: bit 0 positional, bit 1 loop. Data sequences start at 0 and increment by one.
+Codecs: `1` = Ogg Vorbis, `2` = MP3. Flags: bit 0 positional, bit 1 loop. Data sequences start at 0 and increment by one for the lifetime of the stream.
 
 ## Handshake
 
@@ -48,17 +51,20 @@ Paper only sends server-to-client plugin messages after it has seen the client's
 1. Client sends HELLO.
 2. Server replies HELLO_ACK.
 3. Server may send HELLO_QUERY after a reload; the client answers with HELLO.
-4. Server sends OPEN, DATA frames, then END.
-5. Client validates codec, sequence, and exact byte count; playback may begin before END after the prebuffer.
-6. Client continues decoding while the rest of the file arrives.
-7. Client sends DONE when playback finishes, is stopped, or fails.
+4. Server sends OPEN, then DATA frames while the stream has credit.
+5. Non-loop streams end with END; loop streams send LOOP after every complete pass and continue with the next pass.
+6. Client validates codec, sequence, and exact byte count; playback may begin before the end after the prebuffer.
+7. Client sends CREDIT as the decoder consumes bytes so the server can continue sending.
+8. Client sends DONE when playback finishes, is stopped, or fails.
 
 ## Transfer behavior
 
 - Server chunk size is negotiated down to the client's maximum (default 32 KiB).
-- The server sends up to 1 MiB per server tick, so a large song does not block the main thread in one burst.
-- The client buffers the entire file in memory and begins playback after a short lead-in.
-- END is sent only after the final byte.
+- The server sends at most `send-bytes-per-tick` per stream (1 MiB by default), and only while the stream has credit.
+- The client starts with the negotiated window as its credit, then sends CREDIT for bytes the decoder has consumed. This bounds memory independently of file size.
+- Loop streams are continuously re-sent: after `totalBytes` of DATA the server sends LOOP, rewinds the file, and sends the next pass without closing the stream.
+- The client begins playback after a short lead-in.
+- END is sent only for non-loop streams after the final byte.
 - Server-initiated CLOSE stops playback immediately.
 - DONE releases the server session and stream slot.
 
@@ -68,7 +74,9 @@ Paper only sends server-to-client plugin messages after it has seen the client's
 - Ogg Opus and non-Vorbis Ogg are rejected.
 - Extension and container magic must agree.
 - Paths must resolve inside the configured sounds directory, including real-path checks for symlink escapes.
-- Client enforces maximum file size, chunk size, sequence, total byte count, concurrent stream count, and loop-cache limit.
+- Client enforces maximum file size (1 GiB hard cap), chunk size, sequence, per-pass byte count, concurrent stream count.
+- Client enforces the negotiated encoded window; a server that exceeds it fails the stream as a protocol error.
+- A LOOP marker must be preceded by exactly `totalBytes` of DATA for that pass.
 - Non-finite volume, range, or coordinates are rejected.
 
 ## Reasons

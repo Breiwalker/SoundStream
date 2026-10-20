@@ -16,6 +16,9 @@
     ],
     "client": [
       "dev.breiwalker.soundstream.client.SoundstreamClient"
+    ],
+    "modmenu": [
+      "dev.breiwalker.soundstream.client.modmenu.SoundStreamModMenuApi"
     ]
   },
   "mixins": [
@@ -28,6 +31,9 @@
   "depends": {
     "fabricloader": ">=${loader_version}",
     "fabric-api": "*",
-    "minecraft": "${minecraft_version}"
+    "minecraft": ">=26.1.2 <26.4"
+  },
+  "suggests": {
+    "modmenu": "*"
   }
 }

@@ -1,0 +1,10 @@
+{
+  "soundstream.config.title": "SoundStream Settings",
+  "soundstream.config.hint": "Lower prebuffer starts playback faster but may crackle on slow systems. Changes apply to new streams.",
+  "soundstream.config.enabled": "Playback: %s",
+  "soundstream.config.on": "Enabled",
+  "soundstream.config.off": "Disabled",
+  "soundstream.config.volume": "Client Volume: %s",
+  "soundstream.config.prebuffer": "Prebuffer: %s ms",
+  "soundstream.config.reset": "Reset to Defaults"
+}

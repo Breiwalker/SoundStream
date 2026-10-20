@@ -1,5 +1,6 @@
 package dev.breiwalker.soundstream.client.audio;
 
+import dev.breiwalker.soundstream.client.config.SoundStreamConfig;
 import dev.breiwalker.soundstream.client.stream.ClientStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,21 +19,18 @@ final class StreamingSource {
 
     private final ClientStream stream;
     private final AudioEngine engine;
-    private final SourceDataLine line;
+    private final AudioFormat format;
     private final Thread thread;
     private final int fadeFrames;
 
+    private volatile SourceDataLine line;
     private volatile boolean closed;
     private long framesRendered;
 
-    StreamingSource(ClientStream stream, AudioEngine engine) throws Exception {
+    StreamingSource(ClientStream stream, AudioEngine engine) {
         this.stream = stream;
         this.engine = engine;
-        AudioFormat format = new AudioFormat(stream.sampleRate(), 16, 2, true, false);
-        this.line = AudioSystem.getSourceDataLine(format);
-        // A larger output buffer prevents underruns and crackle on loud, dense
-        // tracks while still keeping latency around one second.
-        this.line.open(format, Math.max(32_768, stream.sampleRate() * 4));
+        this.format = new AudioFormat(stream.sampleRate(), 16, 2, true, false);
         this.fadeFrames = Math.max(1, stream.sampleRate() / 50); // 20 ms declick
         this.thread = new Thread(this::run, "SoundStream output " + stream.id());
         this.thread.setDaemon(true);
@@ -45,9 +43,28 @@ final class StreamingSource {
 
     private void run() {
         try {
-            // Fill a small lead-in before starting the device. This absorbs
-            // decoder and GC jitter and removes the start-of-stream click.
-            long prebufferBytes = Math.max(16_384L, stream.sampleRate() * 2L);
+            // Open the device on this thread so decoding and the prebuffer can
+            // proceed in parallel with device initialization.
+            try {
+                SourceDataLine opened = AudioSystem.getSourceDataLine(format);
+                // A larger output buffer prevents underruns and crackle on loud,
+                // dense tracks while still keeping latency around one second.
+                opened.open(format, Math.max(32_768, stream.sampleRate() * 4));
+                this.line = opened;
+            } catch (Throwable throwable) {
+                if (!closed) {
+                    LOGGER.warn("Could not open Java Sound output for SoundStream " + stream.id(), throwable);
+                    stream.onAudioUnavailable();
+                }
+                return;
+            }
+
+            // Fill a short lead-in before starting the device. The configured
+            // prebuffer absorbs decoder/GC jitter and controls time-to-first-sound.
+            int prebufferMillis = SoundStreamConfig.get().getPrebufferMillis();
+            long prebufferBytes = Math.max(4_096L,
+                    (long) stream.sampleRate() * Math.max(1, stream.audioChannels()) * 2L
+                            * prebufferMillis / 1000L);
             while (!closed && stream.running()
                     && !stream.pcmQueue().ended()
                     && stream.pcmQueue().bufferedBytes() < prebufferBytes) {
@@ -131,7 +148,12 @@ final class StreamingSource {
     }
 
     private float[] gains() {
-        float base = clamp(stream.volume()) * clamp(engine.masterVolume()) * 0.92f;
+        SoundStreamConfig config = SoundStreamConfig.get();
+        float base = clamp(stream.volume()) * clamp(engine.masterVolume()) * 0.92f
+                * clamp(config.getVolume());
+        if (!config.isEnabled()) {
+            base = 0.0f;
+        }
         if (!stream.positional()) {
             return new float[]{base, base};
         }
@@ -169,20 +191,27 @@ final class StreamingSource {
         }
         closed = true;
         LOGGER.debug("SoundStream {} stopping output", stream.id());
-        try {
-            line.stop();
-            line.flush();
-        } catch (RuntimeException ignored) {
-            // already closed
+        SourceDataLine current = line;
+        if (current != null) {
+            try {
+                current.stop();
+                current.flush();
+            } catch (RuntimeException ignored) {
+                // already closed
+            }
         }
         thread.interrupt();
     }
 
     private void closeLine() {
+        SourceDataLine current = line;
+        if (current == null) {
+            return;
+        }
         try {
-            line.stop();
-            line.flush();
-            line.close();
+            current.stop();
+            current.flush();
+            current.close();
         } catch (RuntimeException ignored) {
             // already closed
         }

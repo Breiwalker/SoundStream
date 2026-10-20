@@ -14,11 +14,22 @@ public final class ProtocolCodec {
     }
 
     public static byte[] encode(ProtocolMessages message) {
+        return encode(message, Protocol.VERSION);
+    }
+
+    /**
+     * Encodes a message using an older protocol version. Paper uses this to
+     * reply to clients that completed the handshake with an older mod.
+     */
+    public static byte[] encode(ProtocolMessages message, int version) {
+        if (!Protocol.isSupportedVersion(version)) {
+            throw new IllegalArgumentException("Unsupported protocol version " + version);
+        }
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream(256);
             DataOutputStream out = new DataOutputStream(bytes);
             out.writeShort(Protocol.MAGIC);
-            out.writeByte(Protocol.VERSION);
+            out.writeByte(version);
             out.writeByte(typeOf(message));
             out.writeInt(streamIdOf(message));
             writeBody(out, message);
@@ -34,6 +45,13 @@ public final class ProtocolCodec {
      * per-chunk intermediate copy on the server.
      */
     public static byte[] encodeData(int streamId, int sequence, byte[] data, int offset, int length) {
+        return encodeData(streamId, sequence, data, offset, length, Protocol.VERSION);
+    }
+
+    public static byte[] encodeData(int streamId, int sequence, byte[] data, int offset, int length, int version) {
+        if (!Protocol.isSupportedVersion(version)) {
+            throw new IllegalArgumentException("Unsupported protocol version " + version);
+        }
         if (length < 1 || length > Protocol.MAX_DATA_BYTES) {
             throw new IllegalArgumentException("Invalid data length");
         }
@@ -43,13 +61,18 @@ public final class ProtocolCodec {
         byte[] frame = new byte[14 + length];
         ByteBuffer buffer = ByteBuffer.wrap(frame);
         buffer.putShort((short) Protocol.MAGIC);
-        buffer.put((byte) Protocol.VERSION);
+        buffer.put((byte) version);
         buffer.put((byte) Protocol.TYPE_DATA);
         buffer.putInt(streamId);
         buffer.putInt(sequence);
         buffer.putShort((short) length);
         buffer.put(data, offset, length);
         return frame;
+    }
+
+    public static int peekVersion(byte[] frame) throws ProtocolException {
+        checkHeader(frame);
+        return frame[2] & 0xFF;
     }
 
     public static int peekType(byte[] frame) throws ProtocolException {
@@ -90,7 +113,7 @@ public final class ProtocolCodec {
             throw new ProtocolException("Bad protocol magic");
         }
         int version = frame[2] & 0xFF;
-        if (version != Protocol.VERSION) {
+        if (!Protocol.isSupportedVersion(version)) {
             throw new ProtocolException("Unsupported protocol version " + version);
         }
     }
@@ -110,7 +133,7 @@ public final class ProtocolCodec {
                 throw new ProtocolException("Bad protocol magic");
             }
             int version = in.readUnsignedByte();
-            if (version != Protocol.VERSION) {
+            if (!Protocol.isSupportedVersion(version)) {
                 throw new ProtocolException("Unsupported protocol version " + version);
             }
             int type = in.readUnsignedByte();
@@ -175,6 +198,8 @@ public final class ProtocolCodec {
         } else if (message instanceof ProtocolMessages.Close close) {
             out.writeByte(close.reason());
             writeString(out, close.message());
+        } else if (message instanceof ProtocolMessages.Loop) {
+            // no body
         } else {
             throw new IllegalArgumentException("Unknown message type " + message.getClass());
         }
@@ -250,6 +275,7 @@ public final class ProtocolCodec {
                     in.readUnsignedByte(),
                     readString(in)
             );
+            case Protocol.TYPE_LOOP -> new ProtocolMessages.Loop(streamId);
             default -> throw new ProtocolException("Unknown message type " + type);
         };
     }
@@ -285,6 +311,9 @@ public final class ProtocolCodec {
         if (message instanceof ProtocolMessages.Close) {
             return Protocol.TYPE_CLOSE;
         }
+        if (message instanceof ProtocolMessages.Loop) {
+            return Protocol.TYPE_LOOP;
+        }
         throw new IllegalArgumentException("Unknown message type " + message.getClass());
     }
 
@@ -309,6 +338,9 @@ public final class ProtocolCodec {
         }
         if (message instanceof ProtocolMessages.Close close) {
             return close.streamId();
+        }
+        if (message instanceof ProtocolMessages.Loop loop) {
+            return loop.streamId();
         }
         return 0;
     }

@@ -1,5 +1,6 @@
 package dev.breiwalker.soundstream.client;
 
+import dev.breiwalker.soundstream.client.config.SoundStreamConfig;
 import dev.breiwalker.soundstream.client.network.StreamPayload;
 import dev.breiwalker.soundstream.client.stream.StreamManager;
 import net.fabricmc.api.ClientModInitializer;
@@ -18,6 +19,8 @@ public class SoundstreamClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        SoundStreamConfig.load();
+
         PayloadTypeRegistry.clientboundPlay().register(StreamPayload.TYPE, StreamPayload.CODEC);
         PayloadTypeRegistry.serverboundPlay().register(StreamPayload.TYPE, StreamPayload.CODEC);
 

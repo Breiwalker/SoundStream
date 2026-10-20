@@ -22,6 +22,20 @@ class ProtocolCodecTest {
         assertRoundTrip(new ProtocolMessages.End(9));
         assertRoundTrip(new ProtocolMessages.Update(9, 0.25f, 4f, 5f, 6f));
         assertRoundTrip(new ProtocolMessages.Close(9, Protocol.REASON_UNSUPPORTED, "nope"));
+        assertRoundTrip(new ProtocolMessages.Loop(9));
+    }
+
+    @Test
+    void acceptsEverySupportedProtocolVersion() throws Exception {
+        for (int version = Protocol.MIN_SUPPORTED_VERSION; version <= Protocol.VERSION; version++) {
+            byte[] hello = ProtocolCodec.encode(
+                    new ProtocolMessages.Hello(1, 2, 3, 4, 5, "client"), version);
+            assertEquals(version, ProtocolCodec.peekVersion(hello));
+            assertEquals(new ProtocolMessages.Hello(1, 2, 3, 4, 5, "client"),
+                    ProtocolCodec.decode(hello));
+        }
+        assertThrows(ProtocolException.class,
+                () -> ProtocolCodec.peekVersion(new byte[]{0x53, 0x53, 99, 1, 0, 0, 0, 0}));
     }
 
     @Test

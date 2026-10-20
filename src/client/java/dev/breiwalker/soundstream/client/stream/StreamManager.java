@@ -10,12 +10,14 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3fc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Method;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -23,8 +25,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 public final class StreamManager {
     private static final Logger LOGGER = LoggerFactory.getLogger("SoundStream");
-    private static final String CLIENT_VERSION = "soundstream-fabric-1.0.2";
-    private static final int MAX_FILE_BYTES = 64 * 1024 * 1024;
+    private static final String CLIENT_VERSION = "soundstream-fabric-1.1.0";
+    private static Method cameraMethod;
+    private static boolean cameraMethodResolved;
 
     private final Minecraft minecraft;
     private final AudioEngine audio = new AudioEngine();
@@ -36,6 +39,7 @@ public final class StreamManager {
     private int helloDelayTicks;
 
     private int serverChunkBytes = Protocol.DEFAULT_CLIENT_CHUNK_BYTES;
+    private int serverWindowBytes = Protocol.DEFAULT_CLIENT_WINDOW_BYTES;
     private int serverMaxStreams = Protocol.DEFAULT_CLIENT_MAX_STREAMS;
     private int fullBufferBytes = Protocol.DEFAULT_FULL_BUFFER_BYTES;
     private int loopCacheBytes = Protocol.DEFAULT_LOOP_CACHE_BYTES;
@@ -48,6 +52,7 @@ public final class StreamManager {
         connected = true;
         handshaken = false;
         serverChunkBytes = Protocol.DEFAULT_CLIENT_CHUNK_BYTES;
+        serverWindowBytes = Protocol.DEFAULT_CLIENT_WINDOW_BYTES;
         serverMaxStreams = Protocol.DEFAULT_CLIENT_MAX_STREAMS;
         // Fabric's JOIN callback runs before its minecraft:register packet. Sending
         // HELLO immediately makes Paper drop the reply because it does not know the
@@ -85,6 +90,9 @@ public final class StreamManager {
         byte[] frame;
         while ((frame = incoming.poll()) != null && processed++ < 1024) {
             try {
+                if (ProtocolCodec.peekVersion(frame) != Protocol.VERSION) {
+                    continue;
+                }
                 if (ProtocolCodec.peekType(frame) == Protocol.TYPE_DATA) {
                     ProtocolCodec.DataHeader header = ProtocolCodec.peekDataHeader(frame);
                     ClientStream stream = streams.get(header.streamId());
@@ -107,6 +115,7 @@ public final class StreamManager {
         }
 
         updateListener();
+        sendCredits();
         cleanClosedStreams();
 
         if (!handshaken) {
@@ -132,6 +141,7 @@ public final class StreamManager {
                 return;
             }
             serverChunkBytes = Math.min(Protocol.DEFAULT_CLIENT_CHUNK_BYTES, ack.chunkBytes());
+            serverWindowBytes = Math.min(Protocol.DEFAULT_CLIENT_WINDOW_BYTES, ack.windowBytes());
             serverMaxStreams = Math.min(Protocol.DEFAULT_CLIENT_MAX_STREAMS, ack.maxStreams());
             handshaken = true;
             helloDelayTicks = 0;
@@ -155,6 +165,11 @@ public final class StreamManager {
             ClientStream stream = streams.get(end.streamId());
             if (stream != null) {
                 stream.onEnd();
+            }
+        } else if (message instanceof ProtocolMessages.Loop loop) {
+            ClientStream stream = streams.get(loop.streamId());
+            if (stream != null) {
+                stream.onLoop();
             }
         } else if (message instanceof ProtocolMessages.Update update) {
             ClientStream stream = streams.get(update.streamId());
@@ -183,16 +198,12 @@ public final class StreamManager {
             sendDone(open.streamId(), Protocol.REASON_UNSUPPORTED, "Unsupported codec");
             return;
         }
-        if (open.totalBytes() <= 0 || open.totalBytes() > MAX_FILE_BYTES) {
+        if (open.totalBytes() <= 0 || open.totalBytes() > Protocol.MAX_FILE_BYTES) {
             sendDone(open.streamId(), Protocol.REASON_FILE_ERROR, "Invalid stream size");
             return;
         }
         if (!finite(open.volume(), open.range(), open.x(), open.y(), open.z())) {
             sendDone(open.streamId(), Protocol.REASON_PROTOCOL_ERROR, "Non-finite stream metadata");
-            return;
-        }
-        if (open.loop() && open.totalBytes() > loopCacheBytes) {
-            sendDone(open.streamId(), Protocol.REASON_UNSUPPORTED, "File is too large to loop");
             return;
         }
 
@@ -208,6 +219,7 @@ public final class StreamManager {
                 open.positional(),
                 open.loop(),
                 open.totalBytes(),
+                serverWindowBytes,
                 volume,
                 range,
                 open.x(),
@@ -215,6 +227,18 @@ public final class StreamManager {
                 open.z()
         );
         streams.put(open.streamId(), stream);
+    }
+
+    private void sendCredits() {
+        if (!handshaken) {
+            return;
+        }
+        for (ClientStream stream : streams.values()) {
+            int credit = stream.takeCredit();
+            if (credit > 0) {
+                send(new ProtocolMessages.Credit(stream.id(), credit));
+            }
+        }
     }
 
     private void cleanClosedStreams() {
@@ -243,7 +267,7 @@ public final class StreamManager {
             audio.setDeviceName(device);
 
             LocalPlayer player = minecraft.player;
-            Camera camera = minecraft.gameRenderer.mainCamera();
+            Camera camera = mainCamera(minecraft.gameRenderer);
             float master = minecraft.options.getSoundSourceVolume(SoundSource.MASTER);
 
             if (camera != null && camera.isInitialized()) {
@@ -307,6 +331,28 @@ public final class StreamManager {
         return true;
     }
 
+    private static Camera mainCamera(GameRenderer renderer) {
+        if (!cameraMethodResolved) {
+            for (String name : new String[]{"mainCamera", "getMainCamera"}) {
+                try {
+                    cameraMethod = GameRenderer.class.getMethod(name);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                    // try the other mapping
+                }
+            }
+            cameraMethodResolved = true;
+        }
+        if (cameraMethod == null) {
+            return null;
+        }
+        try {
+            return (Camera) cameraMethod.invoke(renderer);
+        } catch (ReflectiveOperationException exception) {
+            return null;
+        }
+    }
+
     private static String truncate(String message) {
         if (message == null) {
             return "";
@@ -314,3 +360,4 @@ public final class StreamManager {
         return message.length() > 200 ? message.substring(0, 200) : message;
     }
 }
+

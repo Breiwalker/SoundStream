@@ -206,8 +206,12 @@ public final class SoundStreamCommand implements CommandExecutor, TabCompleter {
             return filter(List.of("play", "stop", "list", "reload"), args[0]);
         }
         if (args.length == 2) {
+            boolean play = args[0].equalsIgnoreCase("play");
             List<String> names = new ArrayList<>();
             for (Player player : Bukkit.getOnlinePlayers()) {
+                if (play && !sessions.isAvailable(player)) {
+                    continue;
+                }
                 names.add(player.getName());
             }
             return filter(names, args[1]);

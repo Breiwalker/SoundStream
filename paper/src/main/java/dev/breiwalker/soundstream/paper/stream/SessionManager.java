@@ -15,22 +15,25 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
 
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class SessionManager implements SoundStreamService {
     private final SoundStreamPlugin plugin;
     private final SoundLibrary library;
-    private final Map<UUID, PlayerSession> sessions = new HashMap<>();
+    private final Map<UUID, PlayerSession> sessions = new ConcurrentHashMap<>();
 
     private int configuredChunkBytes;
     private int configuredWindowBytes;
+    private int configuredSendBudget;
     private int configuredMaxStreams;
-    private int configuredMaxLoopBytes;
     private float defaultVolume;
     private float defaultRange;
     private boolean missingActionBarEnabled;
@@ -45,9 +48,11 @@ public final class SessionManager implements SoundStreamService {
 
     public void configure() {
         configuredChunkBytes = clamp(plugin.getConfig().getInt("chunk-bytes", 32 * 1024), 1024, 65_535);
-        configuredWindowBytes = clamp(plugin.getConfig().getInt("window-bytes", 512 * 1024), 16 * 1024, 8 * 1024 * 1024);
+        configuredWindowBytes = clamp(plugin.getConfig().getInt("window-bytes",
+                Protocol.DEFAULT_CLIENT_WINDOW_BYTES), 64 * 1024, 16 * 1024 * 1024);
+        configuredSendBudget = clamp(plugin.getConfig().getInt("send-bytes-per-tick", 1024 * 1024),
+                32 * 1024, 16 * 1024 * 1024);
         configuredMaxStreams = clamp(plugin.getConfig().getInt("max-streams-per-player", 4), 1, 16);
-        configuredMaxLoopBytes = clamp(plugin.getConfig().getInt("max-loop-bytes", 8 * 1024 * 1024), 0, 64 * 1024 * 1024);
         defaultVolume = clamp((float) plugin.getConfig().getDouble("default-volume", 1.0), 0.0f, 1.0f);
         defaultRange = Math.max(1.0f, (float) plugin.getConfig().getDouble("default-range", 32.0));
         missingActionBarEnabled = plugin.getConfig().getBoolean("missing-client-actionbar", true);
@@ -56,7 +61,7 @@ public final class SessionManager implements SoundStreamService {
         missingCheckDelayTicks = clamp(plugin.getConfig().getInt("missing-client-delay-ticks", 60), 1, 1200);
     }
 
-    public void onHello(Player player, ProtocolMessages.Hello hello) {
+    public void onHello(Player player, ProtocolMessages.Hello hello, int protocolVersion) {
         PlayerSession session = sessions.computeIfAbsent(player.getUniqueId(), ignored -> new PlayerSession());
         int chunk = Math.min(configuredChunkBytes, hello.maxChunkBytes());
         int window = Math.min(configuredWindowBytes, hello.windowBytes());
@@ -64,6 +69,7 @@ public final class SessionManager implements SoundStreamService {
         if (chunk < 1 || window < 1 || maxStreams < 1) {
             return;
         }
+        session.protocolVersion = protocolVersion;
         session.capabilities = new ClientCapabilities(
                 chunk,
                 window,
@@ -78,15 +84,39 @@ public final class SessionManager implements SoundStreamService {
                 plugin.getPluginMeta().getVersion()
         ));
         plugin.getLogger().info("Accepted SoundStream handshake from " + player.getName()
-                + " (chunk=" + chunk + ", window=" + window + ", streams=" + maxStreams + ")");
+                + " (protocol v" + protocolVersion + ", chunk=" + chunk + ", window=" + window
+                + ", streams=" + maxStreams + ")");
+    }
+
+    public boolean isVersion(Player player, int version) {
+        PlayerSession session = sessions.get(player.getUniqueId());
+        return session != null && session.protocolVersion == version;
     }
 
     public void query(Player player) {
-        send(player, new ProtocolMessages.HelloQuery());
+        PlayerSession session = sessions.get(player.getUniqueId());
+        int version = session == null ? 0 : session.protocolVersion;
+        if (Protocol.isSupportedVersion(version)) {
+            sendVersioned(player, new ProtocolMessages.HelloQuery(), version);
+            return;
+        }
+        for (int candidate = Protocol.MIN_SUPPORTED_VERSION; candidate <= Protocol.VERSION; candidate++) {
+            sendVersioned(player, new ProtocolMessages.HelloQuery(), candidate);
+        }
     }
 
     public void onCredit(Player player, int streamId, int bytes) {
-        // Kept as a no-op for older clients. The full song is sent immediately.
+        if (bytes <= 0) {
+            return;
+        }
+        PlayerSession session = sessions.get(player.getUniqueId());
+        if (session == null) {
+            return;
+        }
+        StreamSession stream = session.streams.get(streamId);
+        if (stream != null) {
+            stream.addCredit(bytes);
+        }
     }
 
     public void onDone(Player player, int streamId) {
@@ -96,7 +126,7 @@ public final class SessionManager implements SoundStreamService {
         }
         StreamSession stream = session.streams.remove(streamId);
         if (stream != null) {
-            stream.closed = true;
+            stream.closeQuietly();
             plugin.getLogger().info("SoundStream " + streamId + " finished for " + player.getName());
         }
     }
@@ -208,28 +238,48 @@ public final class SessionManager implements SoundStreamService {
         session.streams.put(id, stream);
 
         library.load(soundId).whenComplete((asset, throwable) ->
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    if (session.streams.get(id) != stream) {
-                        stream.future.completeExceptionally(new IllegalStateException("Stream was stopped"));
-                        return;
-                    }
-                    if (throwable != null) {
-                        session.streams.remove(id);
-                        stream.future.completeExceptionally(rootCause(throwable));
-                        return;
-                    }
-                    if (stream.loop && asset.data().length > Math.min(
-                            session.capabilities.loopCacheBytes,
-                            configuredMaxLoopBytes)) {
-                        session.streams.remove(id);
-                        stream.future.completeExceptionally(
-                                new IllegalArgumentException("Sound is too large to loop"));
-                        return;
-                    }
-                    stream.start(asset);
-                    stream.future.complete(stream.handle);
-                }));
+                onMain(() -> startLoaded(session, stream, id, asset, throwable)));
         return stream.future;
+    }
+
+    private void startLoaded(
+            PlayerSession session,
+            StreamSession stream,
+            int id,
+            SoundAsset asset,
+            Throwable throwable
+    ) {
+        if (session.streams.get(id) != stream) {
+            stream.future.completeExceptionally(new IllegalStateException("Stream was stopped"));
+            return;
+        }
+        if (throwable != null) {
+            session.streams.remove(id);
+            stream.future.completeExceptionally(rootCause(throwable));
+            return;
+        }
+        if (stream.protocolVersion == 1 && asset.size() > Protocol.V1_MAX_FILE_BYTES) {
+            session.streams.remove(id);
+            stream.future.completeExceptionally(
+                    new IllegalArgumentException("Sound exceeds the v1 client's file-size limit"));
+            return;
+        }
+        if (stream.loop && stream.protocolVersion <= 2
+                && asset.size() > Math.max(0, session.capabilities.loopCacheBytes)) {
+            session.streams.remove(id);
+            stream.future.completeExceptionally(
+                    new IllegalArgumentException("Sound is too large to loop"));
+            return;
+        }
+        try {
+            stream.start(asset);
+        } catch (IOException exception) {
+            session.streams.remove(id);
+            stream.future.completeExceptionally(
+                    new IllegalArgumentException("Could not open sound: " + exception.getMessage()));
+            return;
+        }
+        stream.future.complete(stream.handle);
     }
 
     @Override
@@ -296,7 +346,15 @@ public final class SessionManager implements SoundStreamService {
     }
 
     private void send(Player player, ProtocolMessages message) {
-        sendFrame(player, ProtocolCodec.encode(message));
+        PlayerSession session = sessions.get(player.getUniqueId());
+        int version = session != null && Protocol.isSupportedVersion(session.protocolVersion)
+                ? session.protocolVersion
+                : Protocol.VERSION;
+        sendVersioned(player, message, version);
+    }
+
+    private void sendVersioned(Player player, ProtocolMessages message, int version) {
+        sendFrame(player, ProtocolCodec.encode(message, version));
     }
 
     private void sendFrame(Player player, byte[] frame) {
@@ -333,8 +391,9 @@ public final class SessionManager implements SoundStreamService {
     }
 
     private static final class PlayerSession {
-        private ClientCapabilities capabilities;
-        private final Map<Integer, StreamSession> streams = new LinkedHashMap<>();
+        private volatile ClientCapabilities capabilities;
+        private volatile int protocolVersion;
+        private final Map<Integer, StreamSession> streams = new ConcurrentHashMap<>();
         private int nextId = 1;
     }
 
@@ -353,11 +412,18 @@ public final class SessionManager implements SoundStreamService {
         private final int id;
         private final boolean loop;
         private final boolean positional;
+        private final int protocolVersion;
+        private final boolean creditEnabled;
+        private final boolean continuousLoop;
         private final StreamHandle handle;
         private final CompletableFuture<StreamHandle> future = new CompletableFuture<>();
 
         private SoundAsset asset;
-        private int offset;
+        private InputStream input;
+        private byte[] chunkBuffer = new byte[0];
+        private int remaining;
+        private int credit;
+        private int window;
         private int sequence;
         private boolean opened;
         private boolean ended;
@@ -383,19 +449,28 @@ public final class SessionManager implements SoundStreamService {
             this.id = id;
             this.loop = loop;
             this.positional = positional;
+            this.protocolVersion = session.protocolVersion > 0
+                    ? session.protocolVersion
+                    : Protocol.VERSION;
+            this.creditEnabled = protocolVersion >= 2;
+            this.continuousLoop = loop && protocolVersion >= 3;
             this.volume = volume;
             this.range = range;
             this.handle = new Handle(this);
         }
 
-        private void start(SoundAsset asset) {
+        private void start(SoundAsset asset) throws IOException {
             this.asset = asset;
+            this.input = new BufferedInputStream(Files.newInputStream(asset.path()), 64 * 1024);
+            this.remaining = asset.size();
+            this.window = creditEnabled ? session.capabilities.windowBytes : 0;
+            this.credit = creditEnabled ? window : Integer.MAX_VALUE;
             send(player, new ProtocolMessages.Open(
                     id,
                     asset.codec(),
                     positional,
                     loop,
-                    asset.data().length,
+                    asset.size(),
                     volume,
                     range,
                     x,
@@ -406,25 +481,78 @@ public final class SessionManager implements SoundStreamService {
             pump();
         }
 
+        private void addCredit(int bytes) {
+            if (!creditEnabled || closed || ended) {
+                return;
+            }
+            credit = (int) Math.min(window, (long) credit + bytes);
+        }
+
         private void pump() {
             if (closed || !opened || asset == null || ended) {
                 return;
             }
             int chunkBytes = session.capabilities.chunkBytes;
-            int budget = 1024 * 1024;
-            while (offset < asset.data().length && budget > 0) {
-                int length = Math.min(chunkBytes, Math.min(budget, asset.data().length - offset));
-                if (length <= 0) {
-                    break;
+            int budget = configuredSendBudget;
+            try {
+                while (true) {
+                    if (remaining == 0) {
+                        if (continuousLoop) {
+                            send(player, new ProtocolMessages.Loop(id));
+                            rewind();
+                        } else {
+                            send(player, new ProtocolMessages.End(id));
+                            ended = true;
+                            closeInput();
+                            return;
+                        }
+                    }
+                    if (credit <= 0 || budget <= 0) {
+                        break;
+                    }
+                    int length = Math.min(chunkBytes, Math.min(credit, Math.min(budget, remaining)));
+                    if (length <= 0) {
+                        break;
+                    }
+                    if (chunkBuffer.length < length) {
+                        chunkBuffer = new byte[length];
+                    }
+                    readFully(input, chunkBuffer, length);
+                    sendFrame(player, ProtocolCodec.encodeData(
+                            id, sequence++, chunkBuffer, 0, length, protocolVersion));
+                    remaining -= length;
+                    credit -= length;
+                    budget -= length;
                 }
-                sendFrame(player, ProtocolCodec.encodeData(id, sequence++, asset.data(), offset, length));
-                offset += length;
-                budget -= length;
+            } catch (IOException exception) {
+                fail(Protocol.REASON_FILE_ERROR, "Could not read sound: " + exception.getMessage());
             }
-            if (offset >= asset.data().length) {
-                send(player, new ProtocolMessages.End(id));
-                ended = true;
+        }
+
+        private void rewind() throws IOException {
+            closeInput();
+            input = new BufferedInputStream(Files.newInputStream(asset.path()), 64 * 1024);
+            remaining = asset.size();
+        }
+
+        private void readFully(InputStream stream, byte[] target, int length) throws IOException {
+            int read = 0;
+            while (read < length) {
+                int count = stream.read(target, read, length - read);
+                if (count < 0) {
+                    throw new IOException("Unexpected end of file");
+                }
+                read += count;
             }
+        }
+
+        private void fail(int reason, String message) {
+            if (closed) {
+                return;
+            }
+            sendClose(reason, message);
+            session.streams.remove(id);
+            closeQuietly();
         }
 
         private void flushUpdate() {
@@ -446,7 +574,19 @@ public final class SessionManager implements SoundStreamService {
                 return;
             }
             closed = true;
+            closeInput();
             future.completeExceptionally(new IllegalStateException("Stream closed"));
+        }
+
+        private void closeInput() {
+            if (input != null) {
+                try {
+                    input.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+                input = null;
+            }
         }
     }
 

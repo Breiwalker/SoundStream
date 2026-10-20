@@ -7,7 +7,11 @@ import dev.breiwalker.soundstream.protocol.CodecDetector;
 import dev.breiwalker.soundstream.protocol.Protocol;
 import dev.breiwalker.soundstream.protocol.ProtocolMessages;
 
+import java.util.Arrays;
+
 public final class ClientStream {
+    private static final int CODEC_SAMPLE_BYTES = 64 * 1024;
+
     private final AudioEngine audio;
     private final int id;
     private final int codec;
@@ -15,8 +19,15 @@ public final class ClientStream {
     private final boolean positional;
     private final boolean loop;
     private final PcmQueue pcmQueue = new PcmQueue();
-    private final byte[] fullBuffer;
     private final AudioDecoderThread decoder;
+
+    /**
+     * Every stream, including loops, keeps only a bounded encoded ring buffer.
+     * Loop passes are re-sent by the server and split by LOOP markers.
+     */
+    private final EncodedBuffer encoded;
+    private final byte[] codecSample;
+    private int codecSampleLength;
 
     private volatile float volume;
     private volatile float range;
@@ -36,6 +47,10 @@ public final class ClientStream {
     private volatile int receivedBytes;
     private volatile boolean endReceived;
 
+    private int loopBytesReceived;
+    private int loopBytesRead;
+    private int loopBoundariesPending;
+
     private int expectedSequence;
     private boolean headerChecked;
 
@@ -46,6 +61,7 @@ public final class ClientStream {
             boolean positional,
             boolean loop,
             int totalBytes,
+            int windowBytes,
             float volume,
             float range,
             float x,
@@ -64,10 +80,9 @@ public final class ClientStream {
         this.y = y;
         this.z = z;
 
-        // The server sends the complete song; decoding starts as soon as the
-        // first frames arrive so playback can begin while the rest downloads.
-        this.fullBuffer = new byte[totalBytes];
-        this.decoder = new AudioDecoderThread(this, fullBuffer);
+        this.encoded = new EncodedBuffer(windowBytes);
+        this.codecSample = loop ? null : new byte[Math.min(totalBytes, CODEC_SAMPLE_BYTES)];
+        this.decoder = new AudioDecoderThread(this);
         this.decoder.start();
     }
 
@@ -159,8 +174,8 @@ public final class ClientStream {
     }
 
     /**
-     * Writes a DATA frame payload straight into the full-file buffer without
-     * allocating an intermediate payload array.
+     * Writes a DATA frame payload straight into the bounded encoded buffer
+     * without allocating an intermediate payload array.
      */
     public void onDataFrame(int sequence, byte[] source, int offset, int length) {
         if (!running) {
@@ -170,19 +185,50 @@ public final class ClientStream {
             fail(Protocol.REASON_PROTOCOL_ERROR, "Unexpected chunk sequence");
             return;
         }
-        if (length < 1 || receivedBytes + length > totalBytes) {
-            fail(Protocol.REASON_PROTOCOL_ERROR, "Chunk exceeds declared size");
+        if (length < 1) {
+            fail(Protocol.REASON_PROTOCOL_ERROR, "Empty chunk");
             return;
         }
-        if (!headerChecked) {
-            if (!CodecDetector.matches(codec, source, offset)) {
-                fail(Protocol.REASON_UNSUPPORTED, "Stream container does not match the codec");
+        if (loop) {
+            if (loopBytesReceived + length > totalBytes) {
+                fail(Protocol.REASON_PROTOCOL_ERROR, "Chunk exceeds declared pass size");
                 return;
             }
-            headerChecked = true;
+            if (!headerChecked) {
+                if (!CodecDetector.matches(codec, source, offset)) {
+                    fail(Protocol.REASON_UNSUPPORTED, "Stream container does not match the codec");
+                    return;
+                }
+                headerChecked = true;
+            }
+            if (!encoded.offer(source, offset, length)) {
+                fail(Protocol.REASON_PROTOCOL_ERROR, "Client buffer window exceeded");
+                return;
+            }
+            loopBytesReceived += length;
+        } else {
+            if (receivedBytes + length > totalBytes) {
+                fail(Protocol.REASON_PROTOCOL_ERROR, "Chunk exceeds declared size");
+                return;
+            }
+            if (!headerChecked) {
+                if (!CodecDetector.matches(codec, source, offset)) {
+                    fail(Protocol.REASON_UNSUPPORTED, "Stream container does not match the codec");
+                    return;
+                }
+                headerChecked = true;
+            }
+            if (codecSample != null && codecSampleLength < codecSample.length) {
+                int copy = Math.min(length, codecSample.length - codecSampleLength);
+                System.arraycopy(source, offset, codecSample, codecSampleLength, copy);
+                codecSampleLength += copy;
+            }
+            if (!encoded.offer(source, offset, length)) {
+                fail(Protocol.REASON_PROTOCOL_ERROR, "Client buffer window exceeded");
+                return;
+            }
+            receivedBytes += length;
         }
-        System.arraycopy(source, offset, fullBuffer, receivedBytes, length);
-        receivedBytes += length;
         synchronized (this) {
             notifyAll();
         }
@@ -196,13 +242,44 @@ public final class ClientStream {
         return endReceived;
     }
 
-    public byte[] fullBuffer() {
-        return fullBuffer;
+    /**
+     * Reads encoded bytes for the decoder. Loop streams stop at the end of the
+     * current pass and resume after the next LOOP marker, even if bytes for the
+     * next pass are already buffered.
+     */
+    public int readEncoded(byte[] target, int offset, int length) {
+        if (!running) {
+            return -1;
+        }
+        if (loop) {
+            int remaining = totalBytes - loopBytesRead;
+            if (remaining <= 0) {
+                return -1;
+            }
+            int read = encoded.read(target, offset, Math.min(length, remaining));
+            if (read > 0) {
+                loopBytesRead += read;
+            }
+            return read;
+        }
+        return encoded.read(target, offset, length);
     }
 
-    public boolean awaitData(int position) {
+    public int availableEncoded() {
+        if (loop) {
+            return Math.max(0, Math.min(encoded.available(), totalBytes - loopBytesRead));
+        }
+        return encoded.available();
+    }
+
+    public boolean atPassEnd() {
+        return loop && loopBytesRead >= totalBytes;
+    }
+
+    /** Waits until the server marks the end of the current loop pass. */
+    public boolean awaitLoopBoundary() {
         synchronized (this) {
-            while (running && receivedBytes <= position && !endReceived) {
+            while (running && loopBoundariesPending <= 0) {
                 try {
                     wait(100L);
                 } catch (InterruptedException exception) {
@@ -214,18 +291,39 @@ public final class ClientStream {
         }
     }
 
-    public boolean awaitBytes(int minimum) {
+    /** Called by the decoder after a pass drained and a LOOP marker arrived. */
+    public void beginNextPass() {
         synchronized (this) {
-            while (running && receivedBytes <= minimum && !endReceived) {
-                try {
-                    wait(100L);
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
+            if (loopBoundariesPending > 0) {
+                loopBoundariesPending--;
             }
-            return running;
+            loopBytesRead = 0;
         }
+    }
+
+    /** Server finished one pass of a looped stream; more DATA follows. */
+    public void onLoop() {
+        if (!running) {
+            return;
+        }
+        if (!loop) {
+            fail(Protocol.REASON_PROTOCOL_ERROR, "Unexpected loop boundary");
+            return;
+        }
+        if (loopBytesReceived != totalBytes) {
+            fail(Protocol.REASON_PROTOCOL_ERROR, "Loop pass ended before all bytes arrived");
+            return;
+        }
+        loopBytesReceived = 0;
+        synchronized (this) {
+            loopBoundariesPending++;
+            notifyAll();
+        }
+    }
+
+    /** Bytes to grant back to the server since the previous call. */
+    public int takeCredit() {
+        return encoded.takeCredit();
     }
 
     public boolean awaitEnd() {
@@ -246,12 +344,17 @@ public final class ClientStream {
         if (!running) {
             return;
         }
+        if (loop) {
+            fail(Protocol.REASON_PROTOCOL_ERROR, "Unexpected END on a looped stream");
+            return;
+        }
         if (receivedBytes != totalBytes) {
             fail(Protocol.REASON_PROTOCOL_ERROR, "Stream ended before all bytes arrived");
             return;
         }
         try {
-            int detected = CodecDetector.detect(fullBuffer);
+            byte[] sample = Arrays.copyOf(codecSample, codecSampleLength);
+            int detected = CodecDetector.detect(sample);
             if (detected != codec) {
                 fail(Protocol.REASON_UNSUPPORTED, "Audio container does not match the declared codec");
                 return;
@@ -261,6 +364,7 @@ public final class ClientStream {
             return;
         }
         endReceived = true;
+        encoded.end();
         synchronized (this) {
             notifyAll();
         }
@@ -326,6 +430,7 @@ public final class ClientStream {
         closeReason = reason;
         closeMessage = message == null ? "" : message;
         sendDoneOnClose = sendDone;
+        encoded.close();
         synchronized (this) {
             notifyAll();
         }

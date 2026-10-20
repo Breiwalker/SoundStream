@@ -24,10 +24,15 @@ public final class SoundStreamMessageListener implements PluginMessageListener {
             return;
         }
         try {
+            int version = ProtocolCodec.peekVersion(message);
             ProtocolMessages decoded = ProtocolCodec.decode(message);
             if (decoded instanceof ProtocolMessages.Hello hello) {
-                plugin.getLogger().info("Received SoundStream handshake from " + player.getName());
-                sessions.onHello(player, hello);
+                plugin.getLogger().info("Received SoundStream handshake from " + player.getName()
+                        + " (protocol v" + version + ")");
+                sessions.onHello(player, hello, version);
+            } else if (!sessions.isVersion(player, version)) {
+                plugin.getLogger().fine("Ignoring SoundStream frame with a different protocol version from "
+                        + player.getName());
             } else if (decoded instanceof ProtocolMessages.Credit credit) {
                 sessions.onCredit(player, credit.streamId(), credit.bytes());
             } else if (decoded instanceof ProtocolMessages.Done done) {
