@@ -2,7 +2,7 @@
 
 Channel: `soundstream:main`
 
-All integers are big-endian. The server sends the complete encoded song in DATA frames. Chunking is transport-only; the client allocates `totalBytes`, appends every frame, and starts playback only after END and validation.
+All integers are big-endian. The server sends the complete encoded song in DATA frames. Chunking is transport-only; the client allocates `totalBytes`, appends every frame, and can start progressive playback after a short prebuffer. The complete file is retained for looping and final validation.
 
 ## Header
 
@@ -48,16 +48,16 @@ Paper only sends server-to-client plugin messages after it has seen the client's
 1. Client sends HELLO.
 2. Server replies HELLO_ACK.
 3. Server may send HELLO_QUERY after a reload; the client answers with HELLO.
-4. Server sends OPEN, all DATA frames, then END.
-5. Client validates codec, size, sequence, and exact byte count.
-6. Client plays the complete file.
+4. Server sends OPEN, DATA frames, then END.
+5. Client validates codec, sequence, and exact byte count; playback may begin before END after the prebuffer.
+6. Client continues decoding while the rest of the file arrives.
 7. Client sends DONE when playback finishes, is stopped, or fails.
 
 ## Transfer behavior
 
 - Server chunk size is negotiated down to the client's maximum (default 32 KiB).
 - The server sends up to 1 MiB per server tick, so a large song does not block the main thread in one burst.
-- The client buffers the entire file in memory.
+- The client buffers the entire file in memory and begins playback after a short lead-in.
 - END is sent only after the final byte.
 - Server-initiated CLOSE stops playback immediately.
 - DONE releases the server session and stream slot.

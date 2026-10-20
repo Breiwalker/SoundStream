@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 public final class StreamManager {
     private static final Logger LOGGER = LoggerFactory.getLogger("SoundStream");
-    private static final String CLIENT_VERSION = "soundstream-fabric-1.0.1";
+    private static final String CLIENT_VERSION = "soundstream-fabric-1.0.2";
     private static final int MAX_FILE_BYTES = 64 * 1024 * 1024;
 
     private final Minecraft minecraft;

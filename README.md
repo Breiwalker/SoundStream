@@ -2,9 +2,9 @@
 
 ![SoundStream](thumbnails/modrinth-banner.png)
 
-SoundStream lets a Paper server send `.ogg` and `.mp3` audio to Fabric clients. The client receives the complete song, verifies it, and plays it locally. No resource pack, HTTP server, or client-side sound registration is involved.
+SoundStream lets a Paper server send `.ogg` and `.mp3` audio to Fabric clients. The client plays the song progressively as it downloads, keeps the complete file in memory, and validates it. No resource pack, HTTP server, or client-side sound registration is involved.
 
-The full file is always sent. It is split into small custom-payload frames only because Minecraft limits plugin-message size; the client assembles the whole file before playback starts.
+The full file is always sent. It is split into small custom-payload frames only because Minecraft limits plugin-message size; playback starts after a short prebuffer while the remaining frames continue to arrive.
 
 ## Requirements
 
@@ -87,7 +87,7 @@ Other plugins can stream audio to any online player. Add `depend: [SoundStream]`
 
 ```gradle
 dependencies {
-    compileOnly files('libs/SoundStream-Paper-1.0.1.jar')
+    compileOnly files('libs/SoundStream-Paper-1.0.2.jar')
 }
 ```
 
@@ -145,7 +145,7 @@ The default run target is Paper 26.1.2.
 
 ## Limits and behavior
 
-- Whole-file transfer and whole-file validation before playback.
+- Progressive playback with a short lead-in buffer; the complete file is retained and validated.
 - Maximum file size is server-configurable; the client also enforces a hard limit.
 - At most four concurrent streams per player by default.
 - Looping reuses the complete buffered file and is limited by `max-loop-bytes`.
@@ -155,6 +155,12 @@ The default run target is Paper 26.1.2.
 - Custom payloads are unencrypted but travel inside the normal authenticated Minecraft connection.
 
 ## Changelog
+
+### 1.0.2
+
+- Progressive Spotify-style playback: decoding and playback start after a short prebuffer while the rest of the song downloads.
+- The complete file is still retained for looping and final validation.
+- Fixed stop handling so output halts immediately and the audio thread exits.
 
 ### 1.0.1
 

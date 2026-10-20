@@ -33,8 +33,9 @@ public final class ClientStream {
     private volatile int closeReason = Protocol.REASON_STOPPED;
     private volatile String closeMessage = "";
     private volatile boolean sendDoneOnClose;
+    private volatile int receivedBytes;
+    private volatile boolean endReceived;
 
-    private int receivedBytes;
     private int expectedSequence;
     private boolean headerChecked;
 
@@ -63,10 +64,11 @@ public final class ClientStream {
         this.y = y;
         this.z = z;
 
-        // The server sends the complete song. Chunking exists only because a
-        // Minecraft custom payload has a small size limit.
+        // The server sends the complete song; decoding starts as soon as the
+        // first frames arrive so playback can begin while the rest downloads.
         this.fullBuffer = new byte[totalBytes];
         this.decoder = new AudioDecoderThread(this, fullBuffer);
+        this.decoder.start();
     }
 
     public int id() {
@@ -181,6 +183,63 @@ public final class ClientStream {
         }
         System.arraycopy(source, offset, fullBuffer, receivedBytes, length);
         receivedBytes += length;
+        synchronized (this) {
+            notifyAll();
+        }
+    }
+
+    public int receivedBytes() {
+        return receivedBytes;
+    }
+
+    public boolean endReceived() {
+        return endReceived;
+    }
+
+    public byte[] fullBuffer() {
+        return fullBuffer;
+    }
+
+    public boolean awaitData(int position) {
+        synchronized (this) {
+            while (running && receivedBytes <= position && !endReceived) {
+                try {
+                    wait(100L);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return running;
+        }
+    }
+
+    public boolean awaitBytes(int minimum) {
+        synchronized (this) {
+            while (running && receivedBytes <= minimum && !endReceived) {
+                try {
+                    wait(100L);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return running;
+        }
+    }
+
+    public boolean awaitEnd() {
+        synchronized (this) {
+            while (running && !endReceived) {
+                try {
+                    wait(100L);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return running;
+        }
     }
 
     public void onEnd() {
@@ -201,7 +260,10 @@ public final class ClientStream {
             fail(Protocol.REASON_UNSUPPORTED, exception.getMessage());
             return;
         }
-        decoder.start();
+        endReceived = true;
+        synchronized (this) {
+            notifyAll();
+        }
     }
 
     public void setFormat(int sampleRate, int channels) {
@@ -264,6 +326,9 @@ public final class ClientStream {
         closeReason = reason;
         closeMessage = message == null ? "" : message;
         sendDoneOnClose = sendDone;
+        synchronized (this) {
+            notifyAll();
+        }
         decoder.stop();
         pcmQueue.close();
         audio.detach(this);
