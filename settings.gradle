@@ -4,6 +4,14 @@ pluginManagement {
             name = 'Fabric'
             url = 'https://maven.fabricmc.net/'
         }
+        maven {
+            name = 'Paper'
+            url = 'https://repo.papermc.io/repository/maven-public/'
+        }
         gradlePluginPortal()
     }
 }
+
+rootProject.name = 'SoundStream'
+
+include 'paper'

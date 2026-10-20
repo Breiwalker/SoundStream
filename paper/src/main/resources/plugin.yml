@@ -1,0 +1,24 @@
+name: SoundStream
+version: ${version}
+main: dev.breiwalker.soundstream.paper.SoundStreamPlugin
+api-version: '26.1'
+folia-supported: false
+description: Streams .ogg and .mp3 audio to Fabric SoundStream clients over plugin messages.
+author: Breiwalker
+commands:
+  soundstream:
+    description: Manage server-streamed audio.
+    usage: /soundstream <play|stop|list|reload>
+permissions:
+  soundstream.play:
+    description: Allows starting SoundStreams.
+    default: op
+  soundstream.stop:
+    description: Allows stopping SoundStreams.
+    default: op
+  soundstream.admin:
+    description: Allows listing files and reloading SoundStream.
+    default: op
+  soundstream.receive:
+    description: Allows a player to receive SoundStreams.
+    default: true

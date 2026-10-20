@@ -1,0 +1,53 @@
+plugins {
+    id 'java'
+    id 'xyz.jpenilla.run-paper' version '3.1.0'
+}
+
+group = project.maven_group
+version = project.mod_version
+
+base {
+    archivesName = 'SoundStream-Paper'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Paper'
+        url = 'https://repo.papermc.io/repository/maven-public/'
+    }
+}
+
+sourceSets {
+    main {
+        java.srcDir '../common/src/main/java'
+    }
+}
+
+dependencies {
+    compileOnly 'io.papermc.paper:paper-api:26.1.2.build.74-stable'
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
+    withSourcesJar()
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filteringCharset 'UTF-8'
+    filesMatching('plugin.yml') {
+        expand version: project.version
+    }
+}
+
+jar {
+    from(rootProject.file('LICENSE.txt')) {
+        rename { "${it}_SoundStream-Paper" }
+    }
+}
+
+tasks.named('runServer') {
+    minecraftVersion(project.findProperty('paperTestVersion') ?: '26.1.2')
+    jvmArgs('-Dcom.mojang.eula.agree=true')
+}

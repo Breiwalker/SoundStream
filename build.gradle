@@ -28,11 +28,13 @@ fabricApi {
 }
 
 repositories {
-    // Add repositories to retrieve artifacts from in here.
-    // You should only use this when depending on other mods because
-    // Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
-    // See https://docs.gradle.org/current/userguide/declaring_repositories.html
-    // for more information about repositories.
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java.srcDir 'common/src/main/java'
+    }
 }
 
 dependencies {
@@ -41,6 +43,19 @@ dependencies {
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    compileOnly "org.lwjgl:lwjgl-stb:3.4.3"
+
+    implementation "javazoom:jlayer:1.0.1"
+    include "javazoom:jlayer:1.0.1"
+
+    testImplementation platform("org.junit:junit-bom:5.11.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+    useJUnitPlatform()
 }
 
 processResources {

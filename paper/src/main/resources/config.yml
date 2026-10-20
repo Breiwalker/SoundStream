@@ -1,0 +1,26 @@
+# Files are addressed relative to this directory, for example music/theme.ogg.
+# Only .ogg (Vorbis) and .mp3 files are accepted. Absolute paths and traversal are rejected.
+sounds-directory: sounds
+
+# Maximum size of one source file.
+max-file-bytes: 33554432
+
+# Largest file the client is allowed to retain for looping.
+max-loop-bytes: 8388608
+
+# Per-player limits. The client's advertised limits are also enforced.
+max-streams-per-player: 4
+window-bytes: 524288
+chunk-bytes: 32768
+
+# Used by the /soundstream play command unless overridden.
+default-volume: 1.0
+default-range: 32.0
+
+# Action bar shown to players who do not have the Fabric client mod.
+# Set missing-client-actionbar to false to disable it.
+# Legacy color codes using & are supported.
+missing-client-actionbar: true
+missing-client-message: "&eYou currently dont have SoundStream installed, means you cant hear the special music/sounds!"
+# Grace period before the join check so a modded client can finish its handshake.
+missing-client-delay-ticks: 60
